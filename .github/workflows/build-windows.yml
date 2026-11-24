@@ -1,10 +1,11 @@
 name: Build Windows exe
 
-# Builds PicoApkGrabber.exe on GitHub's Windows machines and attaches it to the
-# release for the pushed tag (creating the release if needed).
+# Builds PicoApkGrabber.exe on GitHub's Windows machines. When a release is published
+# on GitHub, the .exe is attached to it (and the APK is carried over if missing).
+# Running it by hand (Actions -> Run workflow) just builds a downloadable artifact.
 on:
-  push:
-    tags: ["v*"]
+  release:
+    types: [published]
   workflow_dispatch:
 
 permissions:
@@ -39,11 +40,11 @@ jobs:
           path: dist/PicoApkGrabber.exe
 
       - name: Attach to the release
-        if: startsWith(github.ref, 'refs/tags/')
+        if: github.event_name == 'release'
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
-          TAG: ${{ github.ref_name }}
+          TAG: ${{ github.event.release.tag_name }}
         run: |
           if ! gh release view "$TAG" >/dev/null 2>&1; then
             gh release create "$TAG" --title "Pico APK Grabber $TAG" --notes-file RELEASE_NOTES.md

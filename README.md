@@ -73,7 +73,7 @@ It uses the same PICO Store calls as
   `dist\PicoApkGrabber.exe`.
 
 The .exe on the Releases page is built by GitHub Actions
-(`.github/workflows/build-windows.yml`) whenever a `v*` tag is pushed.
+(`.github/workflows/build-windows.yml`) whenever a release is published.
 
 ### Use it
 
