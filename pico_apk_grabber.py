@@ -5,6 +5,10 @@ account owns, and downloads the official APK (MD5-verified) for those apps.
 The PICO server only issues download links for apps your account owns, and
 this tool only requests links for apps PICO reports as owned.
 
+It can also install the APK on a headset connected by USB, using ADB (Android
+platform-tools). If ADB isn't installed, it offers to download Google's official
+platform-tools.
+
 Standard library only (tkinter + urllib), so it packages cleanly with
 auto-py-to-exe / PyInstaller.
 
@@ -20,11 +24,14 @@ import json
 import os
 import queue
 import re
+import shutil
+import subprocess
 import sys
 import threading
 import time
 import traceback
 import webbrowser
+import zipfile
 from dataclasses import dataclass, field
 from pathlib import Path
 from urllib.error import HTTPError, URLError
@@ -32,7 +39,7 @@ from urllib.parse import urlencode, urlparse
 from urllib.request import Request, urlopen
 
 APP_NAME = "Pico APK Grabber"
-APP_VERSION = "1.0.0"
+APP_VERSION = "1.1.0"
 
 # ---------------------------------------------------------------------------
 # PICO protocol (international store)
@@ -442,6 +449,196 @@ def download_file(f: DownloadFile, dest: Path, progress=None, cancel: threading.
 
 
 # ---------------------------------------------------------------------------
+# ADB (install on a headset connected by USB)
+# ---------------------------------------------------------------------------
+
+PLATFORM_TOOLS_URL = "https://dl.google.com/android/repository/platform-tools-latest-{os}.zip"
+PLATFORM_TOOLS_PAGE = "https://developer.android.com/tools/releases/platform-tools"
+ADB_EXE = "adb.exe" if sys.platform == "win32" else "adb"
+
+INSTALL_HINTS = {
+    "INSTALL_FAILED_UPDATE_INCOMPATIBLE":
+        "a copy signed differently is already installed - uninstall it from the headset first",
+    "INSTALL_FAILED_VERSION_DOWNGRADE": "a newer version is already installed on the headset",
+    "INSTALL_FAILED_INSUFFICIENT_STORAGE": "not enough free space on the headset",
+    "INSTALL_FAILED_OLDER_SDK": "the app needs a newer Android version than the headset has",
+    "INSTALL_FAILED_NO_MATCHING_ABIS": "the app isn't built for this headset's processor",
+    "INSTALL_FAILED_USER_RESTRICTED": "the headset blocked the install - allow it on the headset",
+    "INSTALL_FAILED_VERIFICATION_FAILURE": "the headset rejected the app (verification failed)",
+}
+
+
+@dataclass
+class AdbDevice:
+    serial: str
+    state: str
+    model: str = ""
+
+    def label(self) -> str:
+        return f"{self.model or 'Android device'} ({self.serial})"
+
+
+def platform_tools_dir() -> Path:
+    return data_dir() / "platform-tools"
+
+
+def find_adb() -> str | None:
+    """ADB downloaded by this app first, then any adb on PATH."""
+    local = platform_tools_dir() / ADB_EXE
+    if local.is_file():
+        return str(local)
+    return shutil.which("adb")
+
+
+def download_platform_tools(progress=None, cancel: threading.Event | None = None) -> str:
+    """Download and unpack Google's platform-tools into the app's data folder."""
+    osname = {"win32": "windows", "darwin": "darwin"}.get(sys.platform, "linux")
+    url = PLATFORM_TOOLS_URL.format(os=osname)
+    if not (url.startswith("https://") or (ALLOW_HTTP_DOWNLOADS and url.startswith("http://"))):
+        raise PicoError("Refusing a non-HTTPS download")
+    zpath = data_dir() / "platform-tools.zip.part"
+    try:
+        with urlopen(Request(url, headers={"User-Agent": USER_AGENT}), timeout=60) as resp, \
+                open(zpath, "wb") as out:
+            total = int(resp.headers.get("Content-Length") or 0)
+            done = 0
+            while True:
+                if cancel is not None and cancel.is_set():
+                    raise Cancelled("Download cancelled.")
+                chunk = resp.read(256 * 1024)
+                if not chunk:
+                    break
+                out.write(chunk)
+                done += len(chunk)
+                if progress:
+                    progress(done, total)
+        dest_root = data_dir().resolve()
+        tmp = data_dir() / "platform-tools.new"
+        shutil.rmtree(tmp, ignore_errors=True)
+        with zipfile.ZipFile(zpath) as z:
+            for m in z.infolist():
+                name = m.filename
+                if not name.startswith("platform-tools/") or ".." in Path(name).parts \
+                        or Path(name).is_absolute():
+                    continue  # only extract the expected folder, never outside it
+                target = (tmp / Path(name).relative_to("platform-tools")).resolve()
+                if not str(target).startswith(str(tmp.resolve())):
+                    continue
+                if m.is_dir():
+                    target.mkdir(parents=True, exist_ok=True)
+                    continue
+                target.parent.mkdir(parents=True, exist_ok=True)
+                with z.open(m) as src, open(target, "wb") as dst:
+                    shutil.copyfileobj(src, dst)
+                mode = (m.external_attr >> 16) & 0o777
+                if os.name != "nt":
+                    os.chmod(target, (mode | 0o600) if mode else 0o644)
+        exe = tmp / ADB_EXE
+        if not exe.is_file():
+            shutil.rmtree(tmp, ignore_errors=True)
+            raise PicoError("The platform-tools download didn't contain adb.")
+        if os.name != "nt":
+            os.chmod(exe, 0o755)
+        final = platform_tools_dir()
+        assert final.resolve().parent == dest_root
+        shutil.rmtree(final, ignore_errors=True)
+        os.replace(tmp, final)
+        return str(final / ADB_EXE)
+    except zipfile.BadZipFile as e:
+        raise PicoError("The platform-tools download was damaged. Try again.") from e
+    except (OSError, URLError) as e:
+        raise PicoError(f"Couldn't download platform-tools: {e}") from e
+    finally:
+        zpath.unlink(missing_ok=True)
+
+
+class Adb:
+    def __init__(self, path: str) -> None:
+        self.path = path
+        self._started = False
+
+    def _kw(self) -> dict:
+        kw: dict = {"stdin": subprocess.DEVNULL}
+        if sys.platform == "win32":
+            kw["creationflags"] = 0x08000000  # CREATE_NO_WINDOW
+        return kw
+
+    def start_server(self) -> None:
+        # Started without pipes so the background server can't keep our pipes open.
+        if self._started:
+            return
+        try:
+            subprocess.run([self.path, "start-server"], stdout=subprocess.DEVNULL,
+                           stderr=subprocess.DEVNULL, timeout=60, **self._kw())
+        except subprocess.TimeoutExpired as e:
+            raise PicoError("ADB took too long to start.") from e
+        except OSError as e:
+            raise PicoError(f"Couldn't run adb ({self.path}): {e}") from e
+        self._started = True
+
+    def run(self, *args: str, timeout: int = 60) -> tuple[int, str]:
+        self.start_server()
+        try:
+            r = subprocess.run([self.path, *args], capture_output=True, text=True,
+                               errors="replace", timeout=timeout, **self._kw())
+        except subprocess.TimeoutExpired as e:
+            raise PicoError(f"adb {args[-1] if args else ''} timed out.") from e
+        except OSError as e:
+            raise PicoError(f"Couldn't run adb ({self.path}): {e}") from e
+        return r.returncode, (r.stdout or "") + (r.stderr or "")
+
+    def devices(self) -> list[AdbDevice]:
+        code, out = self.run("devices", "-l")
+        if code != 0:
+            raise PicoError(f"adb devices failed: {out.strip()[:200]}")
+        found = []
+        for line in out.splitlines():
+            parts = line.split()
+            if len(parts) < 2 or line.startswith(("List of", "*")):
+                continue
+            model = next((p.split(":", 1)[1] for p in parts[2:] if p.startswith("model:")), "")
+            found.append(AdbDevice(parts[0], parts[1], model.replace("_", " ")))
+        return found
+
+    def ready_devices(self) -> list[AdbDevice]:
+        devs = self.devices()
+        ready = [d for d in devs if d.state == "device"]
+        if ready:
+            return ready
+        if any(d.state == "unauthorized" for d in devs):
+            raise PicoError("The headset hasn't allowed this computer yet. Put the headset on "
+                            "and accept the 'Allow USB debugging' prompt, then try again.")
+        if devs:
+            raise PicoError(f"The headset isn't ready (state: {devs[0].state}). "
+                            "Reconnect the USB cable and try again.")
+        raise PicoError("No headset found. Connect it with a USB data cable and turn on USB "
+                        "debugging (see the README), then try again.")
+
+    def install(self, serial: str, apk: Path) -> None:
+        code, out = self.run("-s", serial, "install", "-r", str(apk), timeout=1800)
+        if code == 0 and "Success" in out:
+            return
+        m = re.search(r"(INSTALL_[A-Z_]+)", out)
+        if m:
+            hint = INSTALL_HINTS.get(m.group(1))
+            raise PicoError(f"install failed: {m.group(1)}" + (f" ({hint})" if hint else ""))
+        raise PicoError(f"install failed: {out.strip()[-300:] or f'adb exit code {code}'}")
+
+    def push_obb(self, serial: str, package: str, file: Path) -> str:
+        if not PKG_RE.match(package):
+            raise PicoError("Invalid package name")
+        folder = f"/sdcard/Android/obb/{package}"
+        code, out = self.run("-s", serial, "shell", "mkdir", "-p", folder)
+        if code != 0:
+            raise PicoError(f"couldn't create {folder}: {out.strip()[:200]}")
+        remote = f"{folder}/{file.name}"
+        code, out = self.run("-s", serial, "push", str(file), remote, timeout=7200)
+        if code != 0:
+            raise PicoError(f"couldn't copy {file.name} to the headset: {out.strip()[-200:]}")
+        return remote
+
+
+# ---------------------------------------------------------------------------
 # Local storage
 # ---------------------------------------------------------------------------
 
@@ -591,10 +788,11 @@ def run_gui() -> None:
             self.busy = False
             self.q: queue.Queue = queue.Queue()
             self.check_gen = 0
+            self.adb: Adb | None = None
 
             root.title(f"{APP_NAME} {APP_VERSION}")
-            root.geometry("900x620")
-            root.minsize(760, 500)
+            root.geometry("920x720")
+            root.minsize(820, 640)
             self._build()
             root.after(50, self._pump)
             saved = load_json("session.json", None)
@@ -681,16 +879,31 @@ def run_gui() -> None:
             act.pack(fill="x")
             self.dl_btn = ttk.Button(act, text="Download selected", command=self.download_selected)
             self.dl_btn.pack(side="left")
-            self.free_btn = ttk.Button(act, text="Add free app to my library",
-                                       command=self.add_free)
-            self.free_btn.pack(side="left", padx=4)
-            ttk.Button(act, text="Open store page", command=self.open_store).pack(side="left")
-            self.beta = tk.BooleanVar(value=self.settings.get("beta", False))
-            ttk.Checkbutton(act, text="Prefer beta / preview build if available",
-                            variable=self.beta).pack(side="left", padx=10)
+            self.inst_btn = ttk.Button(act, text="Download + install on headset (USB)",
+                                       command=self.download_install)
+            self.inst_btn.pack(side="left", padx=(4, 0))
             self.cancel_btn = ttk.Button(act, text="Cancel", command=self.cancel.set,
                                          state="disabled")
             self.cancel_btn.pack(side="right")
+
+            act2 = ttk.Frame(root, padding=(10, 6, 10, 0))
+            act2.pack(fill="x")
+            self.free_btn = ttk.Button(act2, text="Add free app to my library",
+                                       command=self.add_free)
+            self.free_btn.pack(side="left")
+            ttk.Button(act2, text="Open store page", command=self.open_store).pack(side="left",
+                                                                                padx=4)
+            self.beta = tk.BooleanVar(value=self.settings.get("beta", False))
+            ttk.Checkbutton(act2, text="Prefer beta / preview build if available",
+                            variable=self.beta).pack(side="left", padx=10)
+
+            hs = ttk.Frame(root, padding=(10, 6, 10, 0))
+            hs.pack(fill="x")
+            ttk.Label(hs, text="Headset:").pack(side="left")
+            self.hs_lbl = ttk.Label(hs, text="not checked - connect it by USB to install directly",
+                                    foreground="#666")
+            self.hs_lbl.pack(side="left", padx=4)
+            ttk.Button(hs, text="Check headset", command=self.check_headset).pack(side="right")
 
             pf = ttk.Frame(root, padding=(10, 6))
             pf.pack(fill="x")
@@ -988,6 +1201,95 @@ def run_gui() -> None:
             self.lib_tree.selection_set(self.lib_tree.get_children())
             self._start_downloads(self._selected(), skip_existing=True)
 
+        # -- headset (ADB) ----------------------------------------------------
+        def _with_adb(self, then) -> None:
+            """Find adb (offering to download Google's platform-tools), then call then(adb)."""
+            path = self.settings.get("adb_path") or find_adb()
+            if path and (Path(path).is_file() or shutil.which(path)):
+                if self.adb is None or self.adb.path != path:
+                    self.adb = Adb(path)
+                then(self.adb)
+                return
+            if not messagebox.askyesno(
+                    APP_NAME,
+                    "Installing on a headset needs ADB (Google's Android platform-tools), which "
+                    "wasn't found on this computer.\n\nDownload it now from Google (about 7 MB)? "
+                    f"It's covered by Google's terms:\n{PLATFORM_TOOLS_PAGE}\n\n"
+                    "Choose No to just download APKs instead."):
+                return
+            if self.busy:
+                messagebox.showinfo(APP_NAME, "Wait for the current download to finish.")
+                return
+            self.busy = True
+            self.cancel.clear()
+            self.cancel_btn.configure(state="normal")
+            self.log("Downloading Android platform-tools from Google...")
+
+            def prog(done, total):
+                self.ui(self._set_progress, "platform-tools", done, total)
+
+            def ok(p):
+                self._finish()
+                self.log(f"ADB ready: {p}")
+                self.adb = Adb(p)
+                then(self.adb)
+
+            def fail(e):
+                self._finish()
+                self.error(e)
+            self.bg(lambda: download_platform_tools(prog, self.cancel), ok, fail)
+
+        def _pick_device(self, devs: list[AdbDevice]) -> AdbDevice | None:
+            if len(devs) == 1:
+                return devs[0]
+            from tkinter import simpledialog
+            lines = "\n".join(f"{i + 1}. {d.label()}" for i, d in enumerate(devs))
+            n = simpledialog.askinteger(APP_NAME, f"Several devices are connected:\n\n{lines}"
+                                                  "\n\nInstall on which one? (number)",
+                                        minvalue=1, maxvalue=len(devs), parent=self.root)
+            return devs[n - 1] if n else None
+
+        def check_headset(self) -> None:
+            def go(adb: Adb):
+                self.hs_lbl.configure(text="checking...", foreground="#666")
+
+                def ok(devs):
+                    names = ", ".join(d.label() for d in devs)
+                    self.hs_lbl.configure(text=f"connected: {names}", foreground="#0a7a20")
+                    self.log(f"Headset connected: {names}")
+
+                def fail(e):
+                    self.hs_lbl.configure(text="not ready - see the log", foreground="#b00")
+                    self.error(e)
+                self.bg(adb.ready_devices, ok, fail)
+            self._with_adb(go)
+
+        def download_install(self) -> None:
+            apps = self._selected()
+            if not apps:
+                messagebox.showinfo(APP_NAME, "Select one or more apps first.")
+                return
+            if self.busy:
+                messagebox.showinfo(APP_NAME, "A download is already running.")
+                return
+            if not self._need_session():
+                return
+
+            def go(adb: Adb):
+                def ok(devs):
+                    d = self._pick_device(devs)
+                    if d is None:
+                        return
+                    self.hs_lbl.configure(text=f"connected: {d.label()}", foreground="#0a7a20")
+                    self._start_downloads(apps, install_on=d)
+
+                def fail(e):
+                    self.hs_lbl.configure(text="not ready - see the log", foreground="#b00")
+                    self.error(e)
+                    messagebox.showwarning(APP_NAME, str(e))
+                self.bg(adb.ready_devices, ok, fail)
+            self._with_adb(go)
+
         def _need_session(self) -> bool:
             if self.api.session.valid():
                 return True
@@ -995,7 +1297,8 @@ def run_gui() -> None:
             SignInDialog(self)
             return False
 
-        def _start_downloads(self, apps: list[StoreApp], skip_existing: bool = False) -> None:
+        def _start_downloads(self, apps: list[StoreApp], skip_existing: bool = False,
+                             install_on: AdbDevice | None = None) -> None:
             if self.busy:
                 messagebox.showinfo(APP_NAME, "A download is already running.")
                 return
@@ -1013,6 +1316,8 @@ def run_gui() -> None:
             self.cancel.clear()
             self.cancel_btn.configure(state="normal")
             self.dl_btn.configure(state="disabled")
+            self.inst_btn.configure(state="disabled")
+            adb = self.adb if install_on else None
 
             def progress(name):
                 last = [0.0]
@@ -1026,7 +1331,7 @@ def run_gui() -> None:
                 return cb
 
             def work():
-                ok, failed = 0, []
+                ok, failed, installed = 0, [], 0
                 for a in apps:
                     if self.cancel.is_set():
                         break
@@ -1040,7 +1345,7 @@ def run_gui() -> None:
                         info = self.api.download_info(cur, beta)
                         stem = safe_filename(f"{cur.name}_v{info.version}_{info.version_code}")
                         dest = out / f"{stem}.apk"
-                        if dest.exists() and skip_existing:
+                        if dest.exists() and skip_existing and not adb:
                             self.ui(self.log, f"{cur.name}: already have {dest.name}")
                             ok += 1
                             continue
@@ -1049,11 +1354,29 @@ def run_gui() -> None:
                                           f"({info.version_code}){f', {mb:.1f} MB' if mb else ''}")
                         download_file(info.apk, dest, progress(cur.name), self.cancel)
                         self.ui(self.log, f"{cur.name}: saved {dest.name} (MD5 verified)")
+                        extras = []
                         for x in info.extras:
                             xdest = out / f"{stem}_files" / safe_filename(x.name)
                             self.ui(self.log, f"{cur.name}: extra data file {x.name}")
                             download_file(x, xdest, progress(x.name), self.cancel)
+                            extras.append(xdest)
                         ok += 1
+                        if adb and install_on:
+                            try:
+                                self.ui(self.log, f"{cur.name}: installing on "
+                                                  f"{install_on.label()}...")
+                                self.ui(self._set_progress_text, f"Installing {cur.name}...")
+                                adb.install(install_on.serial, dest)
+                                for xdest in extras:
+                                    self.ui(self.log, f"{cur.name}: copying {xdest.name} "
+                                                      "to the headset...")
+                                    remote = adb.push_obb(install_on.serial, cur.package, xdest)
+                                    self.ui(self.log, f"{cur.name}: copied to {remote}")
+                                installed += 1
+                                self.ui(self.log, f"{cur.name}: installed on the headset")
+                            except PicoError as e:
+                                failed.append(a.name)
+                                self.ui(self.log, f"{cur.name}: saved the APK, but {e}")
                     except Cancelled:
                         self.ui(self.log, "Cancelled.")
                         break
@@ -1062,12 +1385,17 @@ def run_gui() -> None:
                     except PicoError as e:
                         failed.append(a.name)
                         self.ui(self.log, f"{a.name}: {e}")
-                return ok, failed
+                return ok, failed, installed
 
             def done(r):
-                ok, failed = r
+                ok, failed, installed = r
                 self._finish()
-                self.log(f"Done: {ok} downloaded" + (f", {len(failed)} not downloaded (see above)" if failed else ""))
+                msg = f"Done: {ok} downloaded"
+                if adb:
+                    msg += f", {installed} installed on the headset"
+                if failed:
+                    msg += f", {len(failed)} with problems (see above)"
+                self.log(msg)
 
             def fail(e):
                 self._finish()
@@ -1082,10 +1410,15 @@ def run_gui() -> None:
             else:
                 self.prog_lbl.configure(text=f"{name}: {done / 1048576:.1f} MB")
 
+        def _set_progress_text(self, text: str) -> None:
+            self.progress.configure(value=0)
+            self.prog_lbl.configure(text=text)
+
         def _finish(self) -> None:
             self.busy = False
             self.cancel_btn.configure(state="disabled")
             self.dl_btn.configure(state="normal")
+            self.inst_btn.configure(state="normal")
             self.progress.configure(value=0)
             self.prog_lbl.configure(text="")
 

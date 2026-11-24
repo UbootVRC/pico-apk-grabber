@@ -1,0 +1,62 @@
+name: Build Windows exe
+
+# Builds PicoApkGrabber.exe on GitHub's Windows machines and attaches it to the
+# release for the pushed tag (creating the release if needed).
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: API tests against the fake PICO server
+        run: python tests/test_grabber.py
+
+  windows-exe:
+    needs: test
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Build
+        run: |
+          python -m pip install "pyinstaller>=6,<7"
+          python -m PyInstaller --noconfirm --onefile --windowed --name PicoApkGrabber pico_apk_grabber.py
+      - uses: actions/upload-artifact@v4
+        with:
+          name: PicoApkGrabber-windows
+          path: dist/PicoApkGrabber.exe
+
+      - name: Attach to the release
+        if: startsWith(github.ref, 'refs/tags/')
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          if ! gh release view "$TAG" >/dev/null 2>&1; then
+            gh release create "$TAG" --title "Pico APK Grabber $TAG" --notes-file RELEASE_NOTES.md
+          fi
+          gh release upload "$TAG" dist/PicoApkGrabber.exe --clobber
+          # The Android APK is built and signed separately. If this release has none yet,
+          # carry over the APK from the newest earlier release that has one.
+          if ! gh release view "$TAG" --json assets --jq '.assets[].name' | grep -q '\.apk$'; then
+            for prev in $(gh release list --exclude-drafts --limit 30 --json tagName --jq '.[].tagName'); do
+              [ "$prev" = "$TAG" ] && continue
+              if gh release download "$prev" --pattern '*.apk' --dir apk 2>/dev/null; then
+                gh release upload "$TAG" apk/*.apk && echo "Carried over APK from $prev"
+                break
+              fi
+            done
+          fi

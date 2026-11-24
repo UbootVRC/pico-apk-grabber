@@ -1,5 +1,8 @@
 # Pico APK Grabber for Android
 
+> **Status: untested** on a real headset and with PICO's live servers. Please report
+> problems with the text from the app's log.
+
 Runs right on a PICO 4 Enterprise (or any Android phone or PICO headset). It downloads
 the official APKs of consumer PICO Store apps your account owns and installs them on
 the device it's running on, so you can get your consumer apps onto an Enterprise
